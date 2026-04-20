@@ -1,0 +1,13 @@
+/bin/
+*.exe
+*.pem
+*.key
+*.crt
+/configs/relay.yaml
+/configs/agent.yaml
+relay.yaml
+agent.yaml
+state.json
+mars-relay.log*
+mars-agent.log*
+agent-info.txt
