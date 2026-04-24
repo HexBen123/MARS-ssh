@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"mars/internal/agent"
 	"mars/internal/config"
@@ -23,7 +24,10 @@ import (
 	"mars/internal/tlsutil"
 )
 
-const logFileName = "mars-agent.log"
+const (
+	logFileName  = "mars-agent.log"
+	infoFileName = "agent-info.txt"
+)
 
 const (
 	serviceName        = "mars-agent"
@@ -83,12 +87,18 @@ func cmdRun(args []string) {
 		log.Printf("提示：无法打开日志文件（%v），仅输出到 stderr", err)
 	}
 
+	absCfg, err := filepath.Abs(*cfgPath)
+	if err != nil {
+		log.Fatalf("解析配置路径失败：%v", err)
+	}
+	infoPath := filepath.Join(filepath.Dir(absCfg), infoFileName)
+
 	run := func(ctx context.Context) error {
-		cfg, err := config.LoadAgent(*cfgPath)
+		cfg, err := config.LoadAgent(absCfg)
 		if err != nil {
 			return err
 		}
-		return agent.New(cfg).Run(ctx)
+		return agent.New(cfg, infoPath).Run(ctx)
 	}
 
 	if ok, err := service.MaybeRunAsService(serviceName, run); ok {
@@ -281,13 +291,14 @@ func cmdMenu(args []string) {
 			if _, err := logsink.Setup(absCfg, logFileName); err != nil {
 				log.Printf("提示：无法打开日志文件（%v），仅输出到 stderr", err)
 			}
+			infoPath := filepath.Join(filepath.Dir(absCfg), infoFileName)
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
 			cfg, err := config.LoadAgent(absCfg)
 			if err != nil {
 				return err
 			}
-			return agent.New(cfg).Run(ctx)
+			return agent.New(cfg, infoPath).Run(ctx)
 		},
 	}
 	if err := menu.Run(sp); err != nil {
@@ -324,11 +335,46 @@ func cmdInstall(args []string) {
 		ConfigPath:  absCfg,
 		Args:        []string{"run", "-config", absCfg},
 	}
+	installStart := time.Now()
 	if err := service.Install(spec); err != nil {
 		log.Fatalf("注册服务失败：%v", err)
 	}
 	fmt.Printf("服务 %q 已注册并启动（配置：%s）\n", serviceName, absCfg)
+
+	infoPath := filepath.Join(filepath.Dir(absCfg), infoFileName)
+	if content, ok := waitForFreshInfo(infoPath, installStart, 20*time.Second); ok {
+		fmt.Println()
+		fmt.Println("=====================================================")
+		fmt.Println(" 已从中转获取到隧道信息：")
+		fmt.Println("=====================================================")
+		fmt.Print(content)
+		fmt.Println("=====================================================")
+		fmt.Printf(" 以上信息也会持续更新在 %s\n", infoPath)
+	} else {
+		fmt.Println()
+		fmt.Println("提示：20 秒内没等到中转返回隧道信息。")
+		fmt.Printf("     服务日志：%s\n", filepath.Join(filepath.Dir(absCfg), logFileName))
+		fmt.Printf("     注册成功后也会写入 %s（包含 SSH 连接命令）\n", infoPath)
+	}
+	fmt.Println()
 	fmt.Println("现在可以在任何地方直接敲 `ms` 打开管理菜单。")
+}
+
+// waitForFreshInfo polls until agent-info.txt exists with a mtime newer than
+// `after`. Returns the file contents when it does, or (\"\", false) on timeout.
+func waitForFreshInfo(path string, after time.Time, timeout time.Duration) (string, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if info, err := os.Stat(path); err == nil && info.ModTime().After(after) {
+			if b, err := os.ReadFile(path); err == nil {
+				return string(b), true
+			}
+		}
+		if time.Now().After(deadline) {
+			return "", false
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func cmdUninstall(_ []string) {

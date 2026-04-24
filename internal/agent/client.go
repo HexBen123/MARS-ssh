@@ -19,11 +19,15 @@ import (
 )
 
 type Client struct {
-	cfg *config.AgentConfig
+	cfg      *config.AgentConfig
+	infoPath string // where to write the "last registered" info file
 }
 
-func New(cfg *config.AgentConfig) *Client {
-	return &Client{cfg: cfg}
+// New builds a client. infoPath is where we persist the banner (SSH command,
+// assigned port, etc.) so users / install scripts can read it back even when
+// the agent is running as a background service. Empty = skip writing.
+func New(cfg *config.AgentConfig, infoPath string) *Client {
+	return &Client{cfg: cfg, infoPath: infoPath}
 }
 
 func (c *Client) Run(ctx context.Context) error {
@@ -118,7 +122,9 @@ func (c *Client) runOnce(ctx context.Context) error {
 
 	// Also write the last-known SSH string to a file next to the config so the
 	// user can grep it any time (useful when running as a service).
-	_ = writeInfoFile(c.cfg, resp, banner)
+	if c.infoPath != "" {
+		_ = writeInfoFile(c.infoPath, c.cfg, resp, banner)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -154,7 +160,7 @@ func copyBoth(a, b io.ReadWriteCloser) {
 	<-done
 }
 
-func writeInfoFile(cfg *config.AgentConfig, resp protocol.Response, banner string) error {
+func writeInfoFile(path string, cfg *config.AgentConfig, resp protocol.Response, banner string) error {
 	content := fmt.Sprintf(
 		"最后成功注册时间：%s\n"+
 			"中转地址：   %s\n"+
@@ -164,5 +170,5 @@ func writeInfoFile(cfg *config.AgentConfig, resp protocol.Response, banner strin
 		time.Now().Local().Format("2006-01-02 15:04:05"),
 		cfg.Relay, resp.PublicHost, resp.AssignedPort, banner,
 	)
-	return os.WriteFile("agent-info.txt", []byte(content), 0644)
+	return os.WriteFile(path, []byte(content), 0644)
 }
