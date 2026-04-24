@@ -6,11 +6,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_native_tls::TlsStream;
+#[cfg(windows)]
+use tokio_native_tls::TlsConnector as ClientTlsConnector;
+#[cfg(not(windows))]
+use tokio_rustls::rustls::{
+    self,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+    ClientConfig, DigitallySignedStruct, Error, SignatureScheme,
+};
 use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
 use tokio_rustls::TlsAcceptor;
+#[cfg(not(windows))]
+use tokio_rustls::TlsConnector as ClientTlsConnector;
 
 use crate::config::AgentConfig;
+
+#[cfg(windows)]
+pub type ClientTlsStream = tokio_native_tls::TlsStream<TcpStream>;
+#[cfg(not(windows))]
+pub type ClientTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
 pub fn parse_fingerprint(value: &str) -> Result<[u8; 32]> {
     let mut normalized = value.trim().to_ascii_lowercase();
@@ -27,7 +42,7 @@ pub fn parse_fingerprint(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-pub async fn connect_pinned_tls(cfg: &AgentConfig) -> Result<TlsStream<TcpStream>> {
+pub async fn connect_pinned_tls(cfg: &AgentConfig) -> Result<ClientTlsStream> {
     let derived_host = relay_host(&cfg.relay);
     let server_name = cfg
         .server_name
@@ -42,31 +57,14 @@ pub async fn connect_pinned_tls(cfg: &AgentConfig) -> Result<TlsStream<TcpStream
         .context("tcp connect timeout")?
         .with_context(|| format!("dial {}", cfg.relay))?;
 
-    let mut builder = tokio_native_tls::native_tls::TlsConnector::builder();
-    builder
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .min_protocol_version(Some(tokio_native_tls::native_tls::Protocol::Tlsv12));
-    let connector = tokio_native_tls::TlsConnector::from(builder.build().context("build tls")?);
-    let tls = timeout(
-        Duration::from_secs(10),
-        connector.connect(&server_name, tcp),
-    )
-    .await
-    .context("tls handshake timeout")?
-    .context("tls handshake")?;
+    let tls = connect_unverified_tls_stream(tcp, &server_name, Duration::from_secs(10)).await?;
 
     verify_peer_fingerprint(&tls, want)?;
     Ok(tls)
 }
 
-pub fn verify_peer_fingerprint(tls: &TlsStream<TcpStream>, want: [u8; 32]) -> Result<()> {
-    let cert = tls
-        .get_ref()
-        .peer_certificate()
-        .context("get peer certificate")?
-        .ok_or_else(|| anyhow::anyhow!("server presented no certificate"))?;
-    let der = cert.to_der().context("encode peer certificate der")?;
+pub fn verify_peer_fingerprint(tls: &ClientTlsStream, want: [u8; 32]) -> Result<()> {
+    let der = peer_leaf_der(tls)?;
     let got = Sha256::digest(&der);
     if got.as_slice() != want {
         anyhow::bail!(
@@ -78,27 +76,55 @@ pub fn verify_peer_fingerprint(tls: &TlsStream<TcpStream>, want: [u8; 32]) -> Re
 }
 
 pub async fn fetch_fingerprint(addr: &str, server_name: &str) -> Result<String> {
-    let tcp = timeout(Duration::from_secs(10), TcpStream::connect(addr))
+    let tls = connect_unverified_tls(addr, server_name, Duration::from_secs(10)).await?;
+    Ok(fingerprint_from_der(&peer_leaf_der(&tls)?))
+}
+
+pub async fn connect_unverified_tls(
+    addr: &str,
+    server_name: &str,
+    connect_timeout: Duration,
+) -> Result<ClientTlsStream> {
+    let tcp = timeout(connect_timeout, TcpStream::connect(addr))
         .await
         .context("tcp connect timeout")?
         .with_context(|| format!("dial {addr}"))?;
-    let mut builder = tokio_native_tls::native_tls::TlsConnector::builder();
-    builder
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .min_protocol_version(Some(tokio_native_tls::native_tls::Protocol::Tlsv12));
-    let connector = tokio_native_tls::TlsConnector::from(builder.build().context("build tls")?);
-    let tls = timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
-        .await
-        .context("tls handshake timeout")?
-        .context("tls handshake")?;
-    let cert = tls
-        .get_ref()
-        .peer_certificate()
-        .context("get peer certificate")?
-        .ok_or_else(|| anyhow::anyhow!("server presented no certificate"))?;
-    let der = cert.to_der().context("encode peer certificate der")?;
-    Ok(fingerprint_from_der(&der))
+    connect_unverified_tls_stream(tcp, server_name, connect_timeout).await
+}
+
+async fn connect_unverified_tls_stream(
+    tcp: TcpStream,
+    server_name: &str,
+    handshake_timeout: Duration,
+) -> Result<ClientTlsStream> {
+    #[cfg(windows)]
+    {
+        let mut builder = tokio_native_tls::native_tls::TlsConnector::builder();
+        builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .min_protocol_version(Some(tokio_native_tls::native_tls::Protocol::Tlsv12));
+        let connector = ClientTlsConnector::from(builder.build().context("build tls")?);
+        timeout(handshake_timeout, connector.connect(server_name, tcp))
+            .await
+            .context("tls handshake timeout")?
+            .context("tls handshake")
+    }
+
+    #[cfg(not(windows))]
+    {
+        let name = ServerName::try_from(server_name.to_string())
+            .map_err(|_| anyhow::anyhow!("invalid TLS server name: {server_name}"))?;
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
+        let connector = ClientTlsConnector::from(Arc::new(config));
+        timeout(handshake_timeout, connector.connect(name, tcp))
+            .await
+            .context("tls handshake timeout")?
+            .context("tls handshake")
+    }
 }
 
 pub fn fingerprint_from_file(cert_file: &str) -> Result<String> {
@@ -112,6 +138,69 @@ pub fn fingerprint_from_file(cert_file: &str) -> Result<String> {
 fn fingerprint_from_der(der: &[u8]) -> String {
     let sum = Sha256::digest(der);
     format!("sha256:{}", hex::encode(sum))
+}
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+#[cfg(not(windows))]
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[cfg(windows)]
+fn peer_leaf_der(tls: &ClientTlsStream) -> Result<Vec<u8>> {
+    let cert = tls
+        .get_ref()
+        .peer_certificate()
+        .context("get peer certificate")?
+        .ok_or_else(|| anyhow::anyhow!("server presented no certificate"))?;
+    cert.to_der().context("encode peer certificate der")
+}
+
+#[cfg(not(windows))]
+fn peer_leaf_der(tls: &ClientTlsStream) -> Result<Vec<u8>> {
+    let cert = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .ok_or_else(|| anyhow::anyhow!("server presented no certificate"))?;
+    Ok(cert.as_ref().to_vec())
 }
 
 pub fn relay_host(relay: &str) -> Option<String> {

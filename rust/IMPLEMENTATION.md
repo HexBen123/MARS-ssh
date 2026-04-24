@@ -39,16 +39,25 @@ Or from the repository root:
 .\rust\scripts\smoke-bridge.ps1 -Configuration release
 ```
 
+The release script builds Windows binaries locally, builds Linux amd64 binaries
+through WSL, and publishes all runnable artifacts into `rust/bin-rust/`.
+
 The smoke script starts the release `relay.exe` and `agent.exe`, registers the
 agent through the relay, sends `ping` through the assigned public port, and
 expects `pong:ping` from a local TCP echo service behind the agent.
 
-Latest verified Windows release sizes on this workstation:
+Latest verified release files on this workstation:
 
 | Binary | Size |
 | --- | ---: |
-| `agent.exe` | 764416 bytes, 0.73 MiB |
-| `relay.exe` | 1632768 bytes, 1.56 MiB |
+| `rust/bin-rust/agent.exe` | 763392 bytes, 0.73 MiB |
+| `rust/bin-rust/relay.exe` | 1632256 bytes, 1.56 MiB |
+| `rust/bin-rust/agent-linux-amd64` | 1741416 bytes, 1.66 MiB |
+| `rust/bin-rust/relay-linux-amd64` | 1974152 bytes, 1.88 MiB |
+
+The Windows agent uses the platform TLS stack to keep the client binary small.
+The Linux agent uses rustls so the Linux build does not require OpenSSL headers
+or pkg-config on the build machine.
 
 The Go implementation remains in the repository as the baseline/reference while
 the Rust branch is being validated.

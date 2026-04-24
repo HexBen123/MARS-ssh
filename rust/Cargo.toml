@@ -17,12 +17,12 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 time = "=0.3.36"
 tokio = { version = "1.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-native-tls = "0.3"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-yamux = "0.3.18"
 rustls-pemfile = "2.0"
 
 [target.'cfg(windows)'.dependencies]
+tokio-native-tls = "0.3"
 windows-service = "0.8"
 
 [profile.release]

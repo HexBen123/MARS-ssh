@@ -189,6 +189,7 @@ fn systemd_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+#[cfg(windows)]
 fn ms_shortcut_for_windows(spec: &Spec) -> String {
     format!(
         "@echo off\r\nREM mars-shortcut-for={}\r\n\"{}\" ms -config \"{}\" %*\r\n",
@@ -204,6 +205,7 @@ fn ms_shortcut_for_unix(spec: &Spec) -> String {
     )
 }
 
+#[cfg(windows)]
 fn write_ms_shortcut_windows(spec: &Spec) -> Result<()> {
     let path = Path::new(&spec.bin_path)
         .parent()

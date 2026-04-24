@@ -2,8 +2,7 @@ use std::net::IpAddr;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{Duration, Instant};
 
 const SOURCES: &[&str] = &[
     "https://ipv4.icanhazip.com",
@@ -54,20 +53,13 @@ pub async fn discover() -> Result<String> {
 
 async fn fetch_source(url: &str) -> Result<String> {
     let (host, path) = parse_https_url(url)?;
-    let tcp = timeout(
-        Duration::from_secs(2),
-        TcpStream::connect((host.as_str(), 443)),
+    let mut tls = crate::tlsutil::connect_unverified_tls(
+        &format!("{host}:443"),
+        &host,
+        Duration::from_secs(3),
     )
     .await
-    .context("public ip tcp timeout")?
-    .with_context(|| format!("dial {host}:443"))?;
-    let connector = tokio_native_tls::TlsConnector::from(
-        tokio_native_tls::native_tls::TlsConnector::new().context("build tls")?,
-    );
-    let mut tls = timeout(Duration::from_secs(3), connector.connect(&host, tcp))
-        .await
-        .context("public ip tls timeout")?
-        .context("public ip tls handshake")?;
+    .with_context(|| format!("fetch public ip from {source}", source = url))?;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: mars-rs/0.1\r\nConnection: close\r\n\r\n"
     );

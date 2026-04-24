@@ -1,4 +1,5 @@
 /bin/
+/rust/bin-rust/
 *.exe
 *.pem
 *.key
