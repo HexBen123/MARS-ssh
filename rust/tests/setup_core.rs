@@ -51,3 +51,32 @@ fn computes_sha256_fingerprint_from_certificate_file() {
         "sha256:74b49e8e666e83cacb4c8e19cba2d12045ef49e25e6ab6e324d628e57ccf81df"
     );
 }
+
+#[test]
+fn generates_random_relay_token_as_32_bytes_hex() {
+    let token = setup::generate_token_hex().unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+}
+
+#[test]
+fn generates_self_signed_certificate_loadable_by_rust_relay() {
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    dir.push("target");
+    dir.push("test-certs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = dir.join(format!("relay-{}.pem", std::process::id()));
+    let key = dir.join(format!("relay-{}.key", std::process::id()));
+
+    setup::generate_self_signed_cert(
+        cert.to_str().unwrap(),
+        key.to_str().unwrap(),
+        &["127.0.0.1".to_string()],
+    )
+    .unwrap();
+
+    let fingerprint = tlsutil::fingerprint_from_file(cert.to_str().unwrap()).unwrap();
+    assert!(fingerprint.starts_with("sha256:"));
+    mars_agent_rs::tlsutil::load_server_tls_acceptor(cert.to_str().unwrap(), key.to_str().unwrap())
+        .unwrap();
+}
