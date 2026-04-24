@@ -1,9 +1,14 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_native_tls::TlsStream;
+use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
+use tokio_rustls::TlsAcceptor;
 
 use crate::config::AgentConfig;
 
@@ -43,10 +48,13 @@ pub async fn connect_pinned_tls(cfg: &AgentConfig) -> Result<TlsStream<TcpStream
         .danger_accept_invalid_hostnames(true)
         .min_protocol_version(Some(tokio_native_tls::native_tls::Protocol::Tlsv12));
     let connector = tokio_native_tls::TlsConnector::from(builder.build().context("build tls")?);
-    let tls = timeout(Duration::from_secs(10), connector.connect(&server_name, tcp))
-        .await
-        .context("tls handshake timeout")?
-        .context("tls handshake")?;
+    let tls = timeout(
+        Duration::from_secs(10),
+        connector.connect(&server_name, tcp),
+    )
+    .await
+    .context("tls handshake timeout")?
+    .context("tls handshake")?;
 
     verify_peer_fingerprint(&tls, want)?;
     Ok(tls)
@@ -61,13 +69,44 @@ pub fn verify_peer_fingerprint(tls: &TlsStream<TcpStream>, want: [u8; 32]) -> Re
     let der = cert.to_der().context("encode peer certificate der")?;
     let got = Sha256::digest(&der);
     if got.as_slice() != want {
-        anyhow::bail!("certificate fingerprint mismatch: got sha256:{}", hex::encode(got));
+        anyhow::bail!(
+            "certificate fingerprint mismatch: got sha256:{}",
+            hex::encode(got)
+        );
     }
     Ok(())
 }
 
 pub fn relay_host(relay: &str) -> Option<String> {
     relay.rsplit_once(':').map(|(host, _)| host.to_string())
+}
+
+pub fn load_server_tls_acceptor(cert_file: &str, key_file: &str) -> Result<TlsAcceptor> {
+    let certs = load_certs(cert_file)?;
+    let key = load_private_key(key_file)?;
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("build server tls config")?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn load_certs(path: &str) -> Result<Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>> {
+    let mut reader = BufReader::new(File::open(path).with_context(|| format!("open cert {path}"))?);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parse cert {path}"))?;
+    if certs.is_empty() {
+        anyhow::bail!("cert file {path} contains no CERTIFICATE block");
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    let mut reader = BufReader::new(File::open(path).with_context(|| format!("open key {path}"))?);
+    rustls_pemfile::private_key(&mut reader)
+        .with_context(|| format!("parse key {path}"))?
+        .ok_or_else(|| anyhow::anyhow!("key file {path} contains no private key block"))
 }
 
 #[cfg(test)]

@@ -54,7 +54,10 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let mut len = [0u8; 4];
-    reader.read_exact(&mut len).await.context("read frame header")?;
+    reader
+        .read_exact(&mut len)
+        .await
+        .context("read frame header")?;
     let len = u32::from_be_bytes(len) as usize;
     if len == 0 || len > MAX_FRAME_LEN {
         anyhow::bail!("invalid frame length: {}", len);

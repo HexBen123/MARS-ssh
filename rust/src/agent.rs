@@ -61,7 +61,9 @@ pub async fn run_once(cfg: &AgentConfig) -> Result<()> {
     )
     .await
     .context("send hello")?;
-    let response: Response = read_json_frame(&mut ctrl).await.context("read hello response")?;
+    let response: Response = read_json_frame(&mut ctrl)
+        .await
+        .context("read hello response")?;
     let _ = ctrl.shutdown().await;
 
     if response.kind != "ok" {

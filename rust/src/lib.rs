@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod portpool;
 pub mod protocol;
+pub mod relay;
 pub mod state;
 pub mod tlsutil;
 
