@@ -18,6 +18,10 @@ pub fn agent_id_from_hostname(hostname: &str, suffix: &[u8]) -> String {
     format!("{}-{}", sanitize_hostname(hostname), hex::encode(suffix))
 }
 
+pub fn should_run_interactive_wizard(config_exists: bool, running_as_service: bool) -> bool {
+    !config_exists && !running_as_service
+}
+
 pub fn generate_agent_id() -> anyhow::Result<String> {
     let hostname = hostname::get()
         .ok()

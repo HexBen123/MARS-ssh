@@ -1,53 +1,54 @@
-# Rust Rewrite Implementation Plan
+# Rust Rewrite Status
 
 Goal: migrate MARS to Rust while preserving the existing Go behavior, command
 surface, config files, wire protocol, and deployment flow.
 
-Scope:
-- Produce Rust `agent` and `relay` binaries from the `rust/` crate.
-- Keep existing YAML and JSON state formats compatible.
-- Keep the length-prefixed JSON control protocol compatible.
-- Keep TLS fingerprint pinning semantics compatible.
-- Keep yamux stream bridging semantics compatible.
-- Preserve `run`, `ms`, `install`, and `uninstall` command names.
+Current status: feature parity is implemented in the `rust/` crate.
 
-Phases:
+## Delivered Scope
 
-1. Baseline prototype
-   - Keep the already verified Rust agent protocol prototype.
-   - Commit after tests and release build pass.
+- Produces `agent.exe` and `relay.exe` from explicit Cargo bin targets.
+- Preserves the YAML config and JSON state formats used by the Go version.
+- Preserves the 4-byte length-prefixed JSON control protocol.
+- Preserves TLS certificate fingerprint pinning and self-signed relay cert generation.
+- Preserves yamux-based stream multiplexing and TCP bridge behavior.
+- Preserves `run`, `ms`, `install`, and `uninstall` command names for both roles.
+- Preserves first-run and edit-config wizards for both agent and relay.
+- Preserves `agent-info.txt` generation after a successful agent registration.
+- Preserves public IPv4 auto-discovery in the relay wizard.
+- Preserves log fan-out to stderr plus config-directory log files, with 10 MiB rotation.
+- Preserves service management behavior:
+  - Linux: systemd install, uninstall, status, start, stop, restart, enable, disable.
+  - Windows: SCM install, uninstall, status, start, stop, restart, enable, disable.
+  - Windows install also configures service failure restart actions.
+  - `ms` shortcut generation is retained on Linux and Windows.
 
-2. Shared core modules
-   - Split `src/lib.rs` into focused modules for config, protocol, TLS, state,
-     port pool, logging, public IP discovery, service management, and menu.
-   - Add tests for config validation, state persistence, port allocation, and
-     protocol framing.
-   - Commit after `cargo test` and `cargo build --release`.
+## Verification
 
-3. Rust relay
-   - Add `src/bin/relay.rs`.
-   - Implement first-run relay wizard, config loading, TLS listener, agent
-     authentication, sticky port allocation, public listener per agent, and
-     stream bridging.
-   - Verify with the existing Go agent and the Rust agent.
-   - Commit after compatibility testing.
+Run from `rust/`:
 
-4. Rust agent completeness
-   - Add first-run and edit-config wizard.
-   - Write `agent-info.txt` after successful registration.
-   - Preserve reconnect behavior and local bridge behavior.
-   - Commit after compatibility testing against Rust relay and Go relay.
+```powershell
+$env:CARGO_INCREMENTAL='0'; cargo test
+$env:CARGO_INCREMENTAL='0'; cargo build --release --bins
+```
 
-5. Menu and service management
-   - Port `ms` menu behavior for both roles.
-   - Port Windows SCM and Linux systemd install/uninstall/status/start/stop
-     behavior as closely as practical.
-   - Preserve `ms` shortcut generation.
-   - Commit after command-surface checks.
+Or from the repository root:
 
-6. Build and documentation
-   - Add a Rust build script for Windows-hosted cross-target builds if the
-     local toolchain supports the targets.
-   - Document current feature parity and any intentional platform limitations.
-   - Record release binary sizes.
-   - Commit after final verification.
+```powershell
+.\rust\scripts\build-release.ps1
+.\rust\scripts\smoke-bridge.ps1 -Configuration release
+```
+
+The smoke script starts the release `relay.exe` and `agent.exe`, registers the
+agent through the relay, sends `ping` through the assigned public port, and
+expects `pong:ping` from a local TCP echo service behind the agent.
+
+Latest verified Windows release sizes on this workstation:
+
+| Binary | Size |
+| --- | ---: |
+| `agent.exe` | 764416 bytes, 0.73 MiB |
+| `relay.exe` | 1632768 bytes, 1.56 MiB |
+
+The Go implementation remains in the repository as the baseline/reference while
+the Rust branch is being validated.

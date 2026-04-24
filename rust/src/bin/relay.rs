@@ -3,21 +3,28 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 
-const USAGE: &str = r#"MARS relay-rs —— Rust 公网侧反向隧道中转
+const LOG_FILE_NAME: &str = "mars-relay.log";
+const SERVICE_NAME: &str = "mars-relay";
+const SERVICE_DISPLAY_NAME: &str = "MARS Reverse SSH Tunnel Relay";
+const SERVICE_DESCRIPTION: &str = "MARS (Minimal AI Reverse Ssh) 公网中转";
+
+const USAGE: &str = r#"MARS relay —— 公网侧反向隧道中转
 
 用法：
   relay [-config <路径>]              启动（首次运行进入交互向导）
   relay run [-config <路径>]          同上
-  relay help                          显示帮助
-
-说明：
-  当前 Rust relay 已迁移运行主链路和首次运行向导；ms/install/uninstall 将在后续阶段迁移。
+  relay ms [-config <路径>]           打开服务管理菜单
+  relay install [-config <路径>]      注册为系统服务并启动
+  relay uninstall                     停止服务并移除注册
 "#;
+
+#[cfg(windows)]
+windows_service::define_windows_service!(ffi_service_main, relay_service_main);
 
 #[tokio::main]
 async fn main() {
     if let Err(err) = real_main().await {
-        eprintln!("relay-rs 失败：{err:#}");
+        mars_agent_rs::mars_log!("relay 失败：{err:#}");
         std::process::exit(1);
     }
 }
@@ -34,23 +41,55 @@ async fn real_main() -> Result<()> {
     match cmd.as_str() {
         "run" => {
             let cfg_path = parse_config_path(&args)?;
-            if !Path::new(&cfg_path).exists() {
-                run_relay_wizard(&cfg_path, None)?;
+            #[cfg(windows)]
+            {
+                if mars_agent_rs::service::try_start_dispatcher(SERVICE_NAME, ffi_service_main)? {
+                    return Ok(());
+                }
             }
-            let cfg = mars_agent_rs::config::load_relay_config(&cfg_path)?;
-            let store = mars_agent_rs::state::Store::load(&cfg.state_file)?;
-            let server = mars_agent_rs::relay::Server::new(cfg, store);
-            server.run_until_shutdown(wait_for_shutdown()).await
+            ensure_relay_config(&cfg_path, false).await?;
+            run_relay_foreground(cfg_path).await
+        }
+        "ms" | "menu" => {
+            let cfg_path = absolute_config_path(&parse_config_path(&args)?)?;
+            ensure_relay_config(&cfg_path, false).await?;
+            run_relay_menu(cfg_path).await
+        }
+        "install" => {
+            let cfg_path = absolute_config_path(&parse_config_path(&args)?)?;
+            ensure_relay_config(&cfg_path, false).await?;
+            install_relay_service(cfg_path)
+        }
+        "uninstall" => {
+            mars_agent_rs::service::uninstall(SERVICE_NAME)?;
+            println!("服务 {SERVICE_NAME:?} 已移除");
+            Ok(())
         }
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
         }
-        "ms" | "menu" | "install" | "uninstall" => {
-            Err(anyhow!("Rust relay 尚未迁移 `{cmd}`；请继续使用 Go relay"))
-        }
         other => Err(anyhow!("未知命令 {other:?}\n\n{USAGE}")),
     }
+}
+
+#[cfg(windows)]
+fn relay_service_main(_arguments: Vec<std::ffi::OsString>) {
+    if let Err(err) = relay_service_entry() {
+        mars_agent_rs::mars_log!("relay service failed: {err:#}");
+    }
+}
+
+#[cfg(windows)]
+fn relay_service_entry() -> Result<()> {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    let cfg_path = parse_config_path(&args)?;
+    mars_agent_rs::service::run_windows_service(SERVICE_NAME, |shutdown| async move {
+        run_relay_until(cfg_path, async {
+            let _ = shutdown.await;
+        })
+        .await
+    })
 }
 
 async fn wait_for_shutdown() {
@@ -79,7 +118,97 @@ fn parse_config_path(args: &[String]) -> Result<String> {
     Ok(cfg)
 }
 
-fn run_relay_wizard(
+async fn ensure_relay_config(cfg_path: &str, running_as_service: bool) -> Result<()> {
+    if mars_agent_rs::setup::should_run_interactive_wizard(
+        Path::new(cfg_path).exists(),
+        running_as_service,
+    ) {
+        run_relay_wizard(cfg_path, None).await?;
+    }
+    Ok(())
+}
+
+async fn run_relay_foreground(cfg_path: String) -> Result<()> {
+    run_relay_until(cfg_path, wait_for_shutdown()).await
+}
+
+async fn run_relay_until<S>(cfg_path: String, shutdown: S) -> Result<()>
+where
+    S: std::future::Future<Output = ()>,
+{
+    if let Err(err) = mars_agent_rs::logsink::setup(&cfg_path, LOG_FILE_NAME) {
+        mars_agent_rs::mars_log!("提示：无法打开日志文件（{err:#}），仅输出到 stderr");
+    }
+    let cfg = mars_agent_rs::config::load_relay_config(&cfg_path)?;
+    let store = mars_agent_rs::state::Store::load(&cfg.state_file)?;
+    let server = mars_agent_rs::relay::Server::new(cfg, store);
+    server.run_until_shutdown(shutdown).await
+}
+
+async fn run_relay_menu(cfg_path: String) -> Result<()> {
+    let bin = std::env::current_exe()
+        .context("定位自身可执行文件失败")?
+        .to_string_lossy()
+        .to_string();
+    let install_spec = relay_service_spec(bin, cfg_path.clone());
+    let edit_path = cfg_path.clone();
+    let run_path = cfg_path.clone();
+    mars_agent_rs::menu::run(mars_agent_rs::menu::Spec {
+        title: "MARS 中转（relay）".to_string(),
+        service_name: SERVICE_NAME.to_string(),
+        config_path: cfg_path,
+        install_spec,
+        edit_config: Box::new(move || {
+            let path = edit_path.clone();
+            Box::pin(async move {
+                let cur = mars_agent_rs::config::load_relay_config(&path)?;
+                run_relay_wizard(&path, Some(&cur)).await
+            })
+        }),
+        run_foreground: Some(Box::new(move || {
+            let path = run_path.clone();
+            Box::pin(async move { run_relay_foreground(path).await })
+        })),
+    })
+    .await
+}
+
+fn install_relay_service(cfg_path: String) -> Result<()> {
+    let bin = std::env::current_exe()
+        .context("定位自身可执行文件失败")?
+        .to_string_lossy()
+        .to_string();
+    mars_agent_rs::config::load_relay_config(&cfg_path)?;
+    mars_agent_rs::service::install(relay_service_spec(bin, cfg_path.clone()))?;
+    println!("服务 {SERVICE_NAME:?} 已注册并启动（配置：{cfg_path}）");
+    println!("现在可以在任何地方直接敲 `ms` 打开管理菜单。");
+    Ok(())
+}
+
+fn relay_service_spec(bin: String, cfg_path: String) -> mars_agent_rs::service::Spec {
+    mars_agent_rs::service::Spec {
+        name: SERVICE_NAME.to_string(),
+        display_name: SERVICE_DISPLAY_NAME.to_string(),
+        description: SERVICE_DESCRIPTION.to_string(),
+        bin_path: bin,
+        config_path: cfg_path.clone(),
+        args: vec!["run".to_string(), "-config".to_string(), cfg_path],
+        user: String::new(),
+        group: String::new(),
+    }
+}
+
+fn absolute_config_path(path: &str) -> Result<String> {
+    let path = Path::new(path);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(abs.to_string_lossy().to_string())
+}
+
+async fn run_relay_wizard(
     cfg_path: &str,
     existing: Option<&mars_agent_rs::config::RelayConfig>,
 ) -> Result<()> {
@@ -95,7 +224,23 @@ fn run_relay_wizard(
     let default_port = existing
         .and_then(|cfg| port_from_listen(&cfg.listen))
         .unwrap_or(7000);
-    let default_host = existing.map(|cfg| cfg.public_host.as_str()).unwrap_or("");
+    let mut discovered_host = String::new();
+    if existing.is_none() {
+        print!("正在探测公网 IP ...  ");
+        let _ = std::io::stdout().flush();
+        match mars_agent_rs::pubip::discover().await {
+            Ok(ip) => {
+                println!("{ip}");
+                discovered_host = ip;
+            }
+            Err(err) => {
+                println!("失败（{err:#}）");
+            }
+        }
+    }
+    let default_host = existing
+        .map(|cfg| cfg.public_host.as_str())
+        .unwrap_or(discovered_host.as_str());
     let default_min = existing.map(|cfg| cfg.port_range.min).unwrap_or(20000);
     let default_max = existing.map(|cfg| cfg.port_range.max).unwrap_or(21000);
 

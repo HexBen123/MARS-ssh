@@ -26,6 +26,13 @@ fn builds_agent_id_from_sanitized_hostname_and_hex_suffix() {
 }
 
 #[test]
+fn skips_interactive_wizard_when_started_as_service() {
+    assert!(setup::should_run_interactive_wizard(false, false));
+    assert!(!setup::should_run_interactive_wizard(true, false));
+    assert!(!setup::should_run_interactive_wizard(false, true));
+}
+
+#[test]
 fn bootstrap_agent_config_allows_missing_fingerprint() {
     let cfg = parse_agent_config_for_bootstrap(
         r#"

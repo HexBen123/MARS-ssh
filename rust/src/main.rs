@@ -3,21 +3,28 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 
-const USAGE: &str = r#"MARS agent-rs —— Rust 反向 SSH 隧道目标端
+const LOG_FILE_NAME: &str = "mars-agent.log";
+const SERVICE_NAME: &str = "mars-agent";
+const SERVICE_DISPLAY_NAME: &str = "MARS Reverse SSH Tunnel Agent";
+const SERVICE_DESCRIPTION: &str = "MARS (Minimal AI Reverse Ssh) 目标代理";
+
+const USAGE: &str = r#"MARS agent —— 反向 SSH 隧道目标端
 
 用法：
-  agent-rs [-config <路径>]              启动（首次运行进入交互向导）
-  agent-rs run [-config <路径>]          同上
-  agent-rs help                          显示帮助
-
-说明：
-  当前 Rust agent 已迁移运行主链路和首次运行向导；ms/install/uninstall 将在后续阶段迁移。
+  agent [-config <路径>]              启动（首次运行进入交互向导）
+  agent run [-config <路径>]          同上
+  agent ms [-config <路径>]           打开服务管理菜单
+  agent install [-config <路径>]      注册为系统服务并启动
+  agent uninstall                     停止服务并移除注册
 "#;
+
+#[cfg(windows)]
+windows_service::define_windows_service!(ffi_service_main, agent_service_main);
 
 #[tokio::main]
 async fn main() {
     if let Err(err) = real_main().await {
-        eprintln!("agent-rs 失败：{err:#}");
+        mars_agent_rs::mars_log!("agent 失败：{err:#}");
         std::process::exit(1);
     }
 }
@@ -34,21 +41,55 @@ async fn real_main() -> Result<()> {
     match cmd.as_str() {
         "run" => {
             let cfg_path = parse_config_path(&args)?;
-            if !Path::new(&cfg_path).exists() {
-                run_agent_wizard(&cfg_path, None).await?;
+            #[cfg(windows)]
+            {
+                if mars_agent_rs::service::try_start_dispatcher(SERVICE_NAME, ffi_service_main)? {
+                    return Ok(());
+                }
             }
-            let cfg = mars_agent_rs::load_agent_config(&cfg_path)?;
-            mars_agent_rs::run_forever(cfg).await
+            ensure_agent_config(&cfg_path, false).await?;
+            run_agent_foreground(cfg_path).await
+        }
+        "ms" | "menu" => {
+            let cfg_path = absolute_config_path(&parse_config_path(&args)?)?;
+            ensure_agent_config(&cfg_path, false).await?;
+            run_agent_menu(cfg_path).await
+        }
+        "install" => {
+            let cfg_path = absolute_config_path(&parse_config_path(&args)?)?;
+            ensure_agent_config(&cfg_path, false).await?;
+            install_agent_service(cfg_path)
+        }
+        "uninstall" => {
+            mars_agent_rs::service::uninstall(SERVICE_NAME)?;
+            println!("服务 {SERVICE_NAME:?} 已移除");
+            Ok(())
         }
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
         }
-        "ms" | "menu" | "install" | "uninstall" => {
-            Err(anyhow!("Rust 验证版尚未迁移 `{cmd}`；请继续使用 Go agent"))
-        }
         other => Err(anyhow!("未知命令 {other:?}\n\n{USAGE}")),
     }
+}
+
+#[cfg(windows)]
+fn agent_service_main(_arguments: Vec<std::ffi::OsString>) {
+    if let Err(err) = agent_service_entry() {
+        mars_agent_rs::mars_log!("agent service failed: {err:#}");
+    }
+}
+
+#[cfg(windows)]
+fn agent_service_entry() -> Result<()> {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    let cfg_path = parse_config_path(&args)?;
+    mars_agent_rs::service::run_windows_service(SERVICE_NAME, |shutdown| async move {
+        run_agent_until(cfg_path, async {
+            let _ = shutdown.await;
+        })
+        .await
+    })
 }
 
 fn parse_config_path(args: &[String]) -> Result<String> {
@@ -71,6 +112,102 @@ fn parse_config_path(args: &[String]) -> Result<String> {
         }
     }
     Ok(cfg)
+}
+
+async fn ensure_agent_config(cfg_path: &str, running_as_service: bool) -> Result<()> {
+    if mars_agent_rs::setup::should_run_interactive_wizard(
+        Path::new(cfg_path).exists(),
+        running_as_service,
+    ) {
+        run_agent_wizard(cfg_path, None).await?;
+    }
+    Ok(())
+}
+
+async fn run_agent_foreground(cfg_path: String) -> Result<()> {
+    run_agent_until(cfg_path, wait_for_shutdown()).await
+}
+
+async fn run_agent_until<S>(cfg_path: String, shutdown: S) -> Result<()>
+where
+    S: std::future::Future<Output = ()>,
+{
+    if let Err(err) = mars_agent_rs::logsink::setup(&cfg_path, LOG_FILE_NAME) {
+        mars_agent_rs::mars_log!("提示：无法打开日志文件（{err:#}），仅输出到 stderr");
+    }
+    let cfg = mars_agent_rs::load_agent_config(&cfg_path)?;
+    tokio::pin!(shutdown);
+    tokio::select! {
+        result = mars_agent_rs::run_forever(cfg) => result,
+        _ = &mut shutdown => Ok(()),
+    }
+}
+
+async fn wait_for_shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn run_agent_menu(cfg_path: String) -> Result<()> {
+    let bin = std::env::current_exe()
+        .context("定位自身可执行文件失败")?
+        .to_string_lossy()
+        .to_string();
+    let install_spec = agent_service_spec(bin, cfg_path.clone());
+    let edit_path = cfg_path.clone();
+    let run_path = cfg_path.clone();
+    mars_agent_rs::menu::run(mars_agent_rs::menu::Spec {
+        title: "MARS 目标代理（agent）".to_string(),
+        service_name: SERVICE_NAME.to_string(),
+        config_path: cfg_path,
+        install_spec,
+        edit_config: Box::new(move || {
+            let path = edit_path.clone();
+            Box::pin(async move {
+                let cur = mars_agent_rs::config::load_agent_config_for_bootstrap(&path)?;
+                run_agent_wizard(&path, Some(&cur)).await
+            })
+        }),
+        run_foreground: Some(Box::new(move || {
+            let path = run_path.clone();
+            Box::pin(async move { run_agent_foreground(path).await })
+        })),
+    })
+    .await
+}
+
+fn install_agent_service(cfg_path: String) -> Result<()> {
+    let bin = std::env::current_exe()
+        .context("定位自身可执行文件失败")?
+        .to_string_lossy()
+        .to_string();
+    mars_agent_rs::load_agent_config(&cfg_path)?;
+    mars_agent_rs::service::install(agent_service_spec(bin, cfg_path.clone()))?;
+    println!("服务 {SERVICE_NAME:?} 已注册并启动（配置：{cfg_path}）");
+    println!("现在可以在任何地方直接敲 `ms` 打开管理菜单。");
+    Ok(())
+}
+
+fn agent_service_spec(bin: String, cfg_path: String) -> mars_agent_rs::service::Spec {
+    mars_agent_rs::service::Spec {
+        name: SERVICE_NAME.to_string(),
+        display_name: SERVICE_DISPLAY_NAME.to_string(),
+        description: SERVICE_DESCRIPTION.to_string(),
+        bin_path: bin,
+        config_path: cfg_path.clone(),
+        args: vec!["run".to_string(), "-config".to_string(), cfg_path],
+        user: String::new(),
+        group: String::new(),
+    }
+}
+
+fn absolute_config_path(path: &str) -> Result<String> {
+    let path = Path::new(path);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(abs.to_string_lossy().to_string())
 }
 
 async fn run_agent_wizard(
