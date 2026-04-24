@@ -3,6 +3,7 @@ pub mod config;
 pub mod portpool;
 pub mod protocol;
 pub mod relay;
+pub mod setup;
 pub mod state;
 pub mod tlsutil;
 

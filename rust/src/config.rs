@@ -53,6 +53,16 @@ pub fn parse_agent_config(yaml: &str) -> Result<AgentConfig> {
     Ok(cfg)
 }
 
+pub fn parse_agent_config_for_bootstrap(yaml: &str) -> Result<AgentConfig> {
+    let yaml = yaml.trim_start_matches('\u{feff}');
+    let mut cfg: AgentConfig = serde_yaml::from_str(yaml).context("parse agent yaml")?;
+    if cfg.local_addr.is_empty() {
+        cfg.local_addr = default_local_addr();
+    }
+    validate_agent(&cfg, false)?;
+    Ok(cfg)
+}
+
 pub fn parse_relay_config(yaml: &str) -> Result<RelayConfig> {
     let yaml = yaml.trim_start_matches('\u{feff}');
     let cfg: RelayConfig = serde_yaml::from_str(yaml).context("parse relay yaml")?;
@@ -63,6 +73,11 @@ pub fn parse_relay_config(yaml: &str) -> Result<RelayConfig> {
 pub fn load_agent_config(path: &str) -> Result<AgentConfig> {
     let content = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
     parse_agent_config(&content)
+}
+
+pub fn load_agent_config_for_bootstrap(path: &str) -> Result<AgentConfig> {
+    let content = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    parse_agent_config_for_bootstrap(&content)
 }
 
 pub fn load_relay_config(path: &str) -> Result<RelayConfig> {

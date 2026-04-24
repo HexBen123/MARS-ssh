@@ -77,6 +77,43 @@ pub fn verify_peer_fingerprint(tls: &TlsStream<TcpStream>, want: [u8; 32]) -> Re
     Ok(())
 }
 
+pub async fn fetch_fingerprint(addr: &str, server_name: &str) -> Result<String> {
+    let tcp = timeout(Duration::from_secs(10), TcpStream::connect(addr))
+        .await
+        .context("tcp connect timeout")?
+        .with_context(|| format!("dial {addr}"))?;
+    let mut builder = tokio_native_tls::native_tls::TlsConnector::builder();
+    builder
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .min_protocol_version(Some(tokio_native_tls::native_tls::Protocol::Tlsv12));
+    let connector = tokio_native_tls::TlsConnector::from(builder.build().context("build tls")?);
+    let tls = timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
+        .await
+        .context("tls handshake timeout")?
+        .context("tls handshake")?;
+    let cert = tls
+        .get_ref()
+        .peer_certificate()
+        .context("get peer certificate")?
+        .ok_or_else(|| anyhow::anyhow!("server presented no certificate"))?;
+    let der = cert.to_der().context("encode peer certificate der")?;
+    Ok(fingerprint_from_der(&der))
+}
+
+pub fn fingerprint_from_file(cert_file: &str) -> Result<String> {
+    let certs = load_certs(cert_file)?;
+    let cert = certs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("cert file {cert_file} contains no CERTIFICATE block"))?;
+    Ok(fingerprint_from_der(cert.as_ref()))
+}
+
+fn fingerprint_from_der(der: &[u8]) -> String {
+    let sum = Sha256::digest(der);
+    format!("sha256:{}", hex::encode(sum))
+}
+
 pub fn relay_host(relay: &str) -> Option<String> {
     relay.rsplit_once(':').map(|(host, _)| host.to_string())
 }
